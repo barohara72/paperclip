@@ -111,9 +111,21 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+const DUPLICATE_REUSABLE_OPEN_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "blocked"]);
+const DUPLICATE_RECENT_DONE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
+}
+
+function normalizeDuplicateText(value: string | null | undefined): string {
+  return (value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function isReusableDuplicateCandidate(issue: typeof issues.$inferSelect, now = new Date()): boolean {
+  if (DUPLICATE_REUSABLE_OPEN_STATUSES.has(issue.status)) return true;
+  if (issue.status !== "done" || !issue.completedAt) return false;
+  return now.getTime() - issue.completedAt.getTime() <= DUPLICATE_RECENT_DONE_WINDOW_MS;
 }
 
 async function getProjectDefaultGoalId(
@@ -437,6 +449,148 @@ function withActiveRuns(
 
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
+
+  async function createIssueRecord(
+    companyId: string,
+    data: Omit<typeof issues.$inferInsert, "companyId"> & { labelIds?: string[] },
+  ) {
+    const { labelIds: inputLabelIds, ...issueData } = data;
+    const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+    if (!isolatedWorkspacesEnabled) {
+      delete issueData.executionWorkspaceId;
+      delete issueData.executionWorkspacePreference;
+      delete issueData.executionWorkspaceSettings;
+    }
+    if (data.assigneeAgentId && data.assigneeUserId) {
+      throw unprocessable("Issue can only have one assignee");
+    }
+    if (data.assigneeAgentId) {
+      await assertAssignableAgent(companyId, data.assigneeAgentId);
+    }
+    if (data.assigneeUserId) {
+      await assertAssignableUser(companyId, data.assigneeUserId);
+    }
+    if (data.projectWorkspaceId) {
+      await assertValidProjectWorkspace(companyId, data.projectId, data.projectWorkspaceId);
+    }
+    if (data.executionWorkspaceId) {
+      await assertValidExecutionWorkspace(companyId, data.projectId, data.executionWorkspaceId);
+    }
+    if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
+      throw unprocessable("in_progress issues require an assignee");
+    }
+    return db.transaction(async (tx) => {
+      const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
+      const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
+      let executionWorkspaceSettings =
+        (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
+      if (executionWorkspaceSettings == null && issueData.projectId) {
+        const project = await tx
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+          .then((rows) => rows[0] ?? null);
+        executionWorkspaceSettings =
+          defaultIssueExecutionWorkspaceSettingsForProject(
+            gateProjectExecutionWorkspacePolicy(
+              parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy),
+              isolatedWorkspacesEnabled,
+            ),
+          ) as Record<string, unknown> | null;
+      }
+      let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
+      if (!projectWorkspaceId && issueData.projectId) {
+        const project = await tx
+          .select({
+            executionWorkspacePolicy: projects.executionWorkspacePolicy,
+          })
+          .from(projects)
+          .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+          .then((rows) => rows[0] ?? null);
+        const projectPolicy = parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy);
+        projectWorkspaceId = projectPolicy?.defaultProjectWorkspaceId ?? null;
+        if (!projectWorkspaceId) {
+          projectWorkspaceId = await tx
+            .select({ id: projectWorkspaces.id })
+            .from(projectWorkspaces)
+            .where(and(eq(projectWorkspaces.projectId, issueData.projectId), eq(projectWorkspaces.companyId, companyId)))
+            .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+            .then((rows) => rows[0]?.id ?? null);
+        }
+      }
+      const [company] = await tx
+        .update(companies)
+        .set({ issueCounter: sql`${companies.issueCounter} + 1` })
+        .where(eq(companies.id, companyId))
+        .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+
+      const issueNumber = company.issueCounter;
+      const identifier = `${company.issuePrefix}-${issueNumber}`;
+
+      const values = {
+        ...issueData,
+        originKind: issueData.originKind ?? "manual",
+        goalId: resolveIssueGoalId({
+          projectId: issueData.projectId,
+          goalId: issueData.goalId,
+          projectGoalId,
+          defaultGoalId: defaultCompanyGoal?.id ?? null,
+        }),
+        ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
+        ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
+        companyId,
+        issueNumber,
+        identifier,
+      } as typeof issues.$inferInsert;
+      if (values.status === "in_progress" && !values.startedAt) {
+        values.startedAt = new Date();
+      }
+      if (values.status === "done") {
+        values.completedAt = new Date();
+      }
+      if (values.status === "cancelled") {
+        values.cancelledAt = new Date();
+      }
+
+      const [issue] = await tx.insert(issues).values(values).returning();
+      if (inputLabelIds) {
+        await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
+      }
+      const [enriched] = await withIssueLabels(tx, [issue]);
+      return enriched;
+    });
+  }
+
+  async function findReusableDuplicateChild(
+    companyId: string,
+    data: Omit<typeof issues.$inferInsert, "companyId"> & { labelIds?: string[] },
+  ) {
+    if (!data.parentId) return null;
+
+    const rows = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.parentId, data.parentId)))
+      .orderBy(desc(issues.updatedAt));
+
+    const normalizedTitle = normalizeDuplicateText(data.title);
+    const normalizedDescription = normalizeDuplicateText(data.description);
+    const now = new Date();
+
+    const match = rows.find((row) => {
+      if (!isReusableDuplicateCandidate(row, now)) return false;
+      if ((row.projectId ?? null) !== (data.projectId ?? null)) return false;
+      if ((row.assigneeAgentId ?? null) !== (data.assigneeAgentId ?? null)) return false;
+      if ((row.assigneeUserId ?? null) !== (data.assigneeUserId ?? null)) return false;
+      if (normalizeDuplicateText(row.title) !== normalizedTitle) return false;
+      if (normalizeDuplicateText(row.description) !== normalizedDescription) return false;
+      return true;
+    });
+
+    if (!match) return null;
+    const [enriched] = await withIssueLabels(db, [match]);
+    return enriched ?? null;
+  }
 
   function redactIssueComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
     return {
@@ -853,111 +1007,20 @@ export function issueService(db: Db) {
       companyId: string,
       data: Omit<typeof issues.$inferInsert, "companyId"> & { labelIds?: string[] },
     ) => {
-      const { labelIds: inputLabelIds, ...issueData } = data;
-      const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
-      if (!isolatedWorkspacesEnabled) {
-        delete issueData.executionWorkspaceId;
-        delete issueData.executionWorkspacePreference;
-        delete issueData.executionWorkspaceSettings;
-      }
-      if (data.assigneeAgentId && data.assigneeUserId) {
-        throw unprocessable("Issue can only have one assignee");
-      }
-      if (data.assigneeAgentId) {
-        await assertAssignableAgent(companyId, data.assigneeAgentId);
-      }
-      if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
-      }
-      if (data.projectWorkspaceId) {
-        await assertValidProjectWorkspace(companyId, data.projectId, data.projectWorkspaceId);
-      }
-      if (data.executionWorkspaceId) {
-        await assertValidExecutionWorkspace(companyId, data.projectId, data.executionWorkspaceId);
-      }
-      if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
-        throw unprocessable("in_progress issues require an assignee");
-      }
-      return db.transaction(async (tx) => {
-        const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
-        const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
-        let executionWorkspaceSettings =
-          (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
-        if (executionWorkspaceSettings == null && issueData.projectId) {
-          const project = await tx
-            .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
-            .from(projects)
-            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
-            .then((rows) => rows[0] ?? null);
-          executionWorkspaceSettings =
-            defaultIssueExecutionWorkspaceSettingsForProject(
-              gateProjectExecutionWorkspacePolicy(
-                parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy),
-                isolatedWorkspacesEnabled,
-              ),
-            ) as Record<string, unknown> | null;
-        }
-        let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
-        if (!projectWorkspaceId && issueData.projectId) {
-          const project = await tx
-            .select({
-              executionWorkspacePolicy: projects.executionWorkspacePolicy,
-            })
-            .from(projects)
-            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
-            .then((rows) => rows[0] ?? null);
-          const projectPolicy = parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy);
-          projectWorkspaceId = projectPolicy?.defaultProjectWorkspaceId ?? null;
-          if (!projectWorkspaceId) {
-            projectWorkspaceId = await tx
-              .select({ id: projectWorkspaces.id })
-              .from(projectWorkspaces)
-              .where(and(eq(projectWorkspaces.projectId, issueData.projectId), eq(projectWorkspaces.companyId, companyId)))
-              .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
-              .then((rows) => rows[0]?.id ?? null);
-          }
-        }
-        const [company] = await tx
-          .update(companies)
-          .set({ issueCounter: sql`${companies.issueCounter} + 1` })
-          .where(eq(companies.id, companyId))
-          .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+      return createIssueRecord(companyId, data);
+    },
 
-        const issueNumber = company.issueCounter;
-        const identifier = `${company.issuePrefix}-${issueNumber}`;
+    createOrReuse: async (
+      companyId: string,
+      data: Omit<typeof issues.$inferInsert, "companyId"> & { labelIds?: string[] },
+    ) => {
+      const existing = await findReusableDuplicateChild(companyId, data);
+      if (existing) {
+        return { issue: existing, created: false as const };
+      }
 
-        const values = {
-          ...issueData,
-          originKind: issueData.originKind ?? "manual",
-          goalId: resolveIssueGoalId({
-            projectId: issueData.projectId,
-            goalId: issueData.goalId,
-            projectGoalId,
-            defaultGoalId: defaultCompanyGoal?.id ?? null,
-          }),
-          ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
-          ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
-          companyId,
-          issueNumber,
-          identifier,
-        } as typeof issues.$inferInsert;
-        if (values.status === "in_progress" && !values.startedAt) {
-          values.startedAt = new Date();
-        }
-        if (values.status === "done") {
-          values.completedAt = new Date();
-        }
-        if (values.status === "cancelled") {
-          values.cancelledAt = new Date();
-        }
-
-        const [issue] = await tx.insert(issues).values(values).returning();
-        if (inputLabelIds) {
-          await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
-        }
-        const [enriched] = await withIssueLabels(tx, [issue]);
-        return enriched;
-      });
+      const issue = await createIssueRecord(companyId, data);
+      return { issue, created: true as const };
     },
 
     update: async (id: string, data: Partial<typeof issues.$inferInsert> & { labelIds?: string[] }) => {

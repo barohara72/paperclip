@@ -856,35 +856,37 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
-    const issue = await svc.create(companyId, {
+    const { issue, created } = await svc.createOrReuse(companyId, {
       ...req.body,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
 
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.created",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { title: issue.title, identifier: issue.identifier },
-    });
+    if (created) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { title: issue.title, identifier: issue.identifier },
+      });
 
-    void queueIssueAssignmentWakeup({
-      heartbeat,
-      issue,
-      reason: "issue_assigned",
-      mutation: "create",
-      contextSource: "issue.create",
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
-    });
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.create",
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+      });
+    }
 
-    res.status(201).json(issue);
+    res.status(created ? 201 : 200).json(issue);
   });
 
   router.patch("/issues/:id", validate(updateIssueSchema), async (req, res) => {
